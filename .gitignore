@@ -1,0 +1,21 @@
+# Entornos y secretos
+.venv/
+venv/
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Data lake local (se regenera con el pipeline)
+data/
+*.parquet
+
+# Reportes y notebooks temporales
+.ipynb_checkpoints/
+profile_report.html
+
+# IDE
+.idea/
+.vscode/

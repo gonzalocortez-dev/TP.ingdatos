@@ -1,0 +1,26 @@
+[project]
+name = "cotizaciones-medallion"
+version = "1.0.0"
+description = "Pipeline de ingeniería de datos para cotizaciones de DolarAPI con arquitectura medallion."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=2.2.0",
+    "pyarrow>=16.0.0",
+    "requests>=2.32.0",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
