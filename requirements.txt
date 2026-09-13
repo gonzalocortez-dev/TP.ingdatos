@@ -2,6 +2,12 @@ pandas>=2.2.0
 pyarrow>=16.0.0
 requests>=2.32.0
 python-dotenv>=1.0.1
+pyspark==3.5.3
+delta-spark==3.2.1
 matplotlib>=3.8.0
+sqlalchemy>=2.0.0
+greenlet>=3.0.0
+psycopg2-binary>=2.9.9
+kafka-python>=2.0.2
 pytest>=8.0.0
 jupyter>=1.0.0

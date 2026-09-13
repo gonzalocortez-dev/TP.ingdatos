@@ -10,6 +10,7 @@ __pycache__/
 
 # Data lake local (se regenera con el pipeline)
 data/
+data_lake/
 *.parquet
 
 # Reportes y notebooks temporales
@@ -19,3 +20,7 @@ profile_report.html
 # IDE
 .idea/
 .vscode/
+
+# Certificados TLS de Kafka (no versionar credenciales)
+certs/
+*.pem
