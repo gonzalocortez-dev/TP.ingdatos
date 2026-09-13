@@ -2,23 +2,22 @@
 
 Silver
 ------
-Datos limpios, tipados, deduplicados. Es la tabla de hechos de negocio.
-Se escribe en data_lake/silver/quotes/. Siempre overwrite: se regenera
-desde todo Bronze (ya sea snapshot full o histórico + MERGE incremental).
+Hechos de negocio limpios. Overwrite desde todo Bronze.
+Particionado por year/month/casa: recortes por fecha y mercado
+sin leer la tabla entera.
 
 Gold
 ----
 Modelos analíticos / OLAP a partir de Silver válido:
-- latest: última cotización por casa y moneda
-- daily_metrics: min/max/promedio diario
-- brecha: diferencia vs el dólar oficial
-
-Se escriben en data_lake/gold/<entidad>/ también como Delta.
+- latest: última cotización por casa y moneda (tabla chica, sin partición)
+- daily_metrics: agregados diarios (particionado year/month)
+- brecha: diferencia vs el dólar oficial (tabla chica, sin partición)
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -36,17 +35,17 @@ logger = logging.getLogger(__name__)
 
 
 def persist_silver(silver_df: DataFrame) -> None:
-    """Guarda Silver en Delta. Overwrite: se regenera desde Bronze limpio."""
+    """Guarda Silver en Delta, particionado para lecturas por fecha/casa."""
     SILVER_QUOTES_PATH.mkdir(parents=True, exist_ok=True)
-    out = select_silver_columns(silver_df)
+    silver_contract = select_silver_columns(silver_df)
     (
-        out.write.format("delta")
+        silver_contract.write.format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
         .partitionBy("year", "month", "casa")
         .save(str(SILVER_QUOTES_PATH))
     )
-    logger.info("Silver | escrito Delta en %s", SILVER_QUOTES_PATH)
+    logger.info("Silver | escrito Delta particionado year/month/casa en %s", SILVER_QUOTES_PATH)
 
 
 def read_silver(spark: SparkSession) -> DataFrame:
@@ -55,48 +54,46 @@ def read_silver(spark: SparkSession) -> DataFrame:
 
 
 def build_and_persist_gold(silver_df: DataFrame) -> dict[str, int]:
-    """Construye las tablas Gold y las persiste en Delta.
+    """Construye las tablas Gold y las persiste en Delta."""
+    valid_quotes = silver_df.filter(F.col("quality_ok") == True)  # noqa: E712
+    latest_quotes = build_latest_quotes(valid_quotes)
+    daily_metrics = build_daily_metrics(valid_quotes)
+    official_gap = build_official_gap(latest_quotes)
 
-    Returns:
-        Cantidad de filas por entidad Gold.
-    """
-    valid = silver_df.filter(F.col("quality_ok") == True)  # noqa: E712
-    latest = _build_latest(valid)
-    daily = _build_daily_metrics(valid)
-    brecha = _build_brecha(latest)
-
-    _write_gold(latest, GOLD_LATEST_PATH)
-    _write_gold(daily, GOLD_DAILY_PATH)
-    _write_gold(brecha, GOLD_BRECHA_PATH)
+    write_gold_table(latest_quotes, GOLD_LATEST_PATH)
+    write_gold_table(daily_metrics, GOLD_DAILY_PATH, partition_columns=("year", "month"))
+    write_gold_table(official_gap, GOLD_BRECHA_PATH)
 
     counts = {
-        "gold_latest": latest.count(),
-        "gold_daily_metrics": daily.count(),
-        "gold_brecha": brecha.count(),
+        "gold_latest": latest_quotes.count(),
+        "gold_daily_metrics": daily_metrics.count(),
+        "gold_brecha": official_gap.count(),
     }
     logger.info("Gold | %s", counts)
     return counts
 
 
-def _build_latest(df: DataFrame) -> DataFrame:
+def build_latest_quotes(valid_quotes: DataFrame) -> DataFrame:
     """Última cotización por casa/moneda. USD sale de /v1/dolares."""
-    usd = df.filter((F.col("moneda") == "USD") & (F.col("source") == "dolares"))
-    others = df.filter(F.col("moneda") != "USD")
-    combined = usd.unionByName(others, allowMissingColumns=True)
-    window = Window.partitionBy("casa", "moneda").orderBy(
-        F.col("fecha_actualizacion").desc(), F.col("ingest_ts").desc()
+    usd_from_dolares = valid_quotes.filter(
+        (F.col("moneda") == "USD") & (F.col("origen_datos") == "dolares")
+    )
+    non_usd_quotes = valid_quotes.filter(F.col("moneda") != "USD")
+    combined_quotes = usd_from_dolares.unionByName(non_usd_quotes, allowMissingColumns=True)
+    latest_per_market = Window.partitionBy("casa", "moneda").orderBy(
+        F.col("fecha_actualizacion").desc(), F.col("fecha_ingesta").desc()
     )
     return (
-        combined.withColumn("_rn", F.row_number().over(window))
-        .filter(F.col("_rn") == 1)
-        .drop("_rn")
+        combined_quotes.withColumn("row_version", F.row_number().over(latest_per_market))
+        .filter(F.col("row_version") == 1)
+        .drop("row_version")
     )
 
 
-def _build_daily_metrics(df: DataFrame) -> DataFrame:
+def build_daily_metrics(valid_quotes: DataFrame) -> DataFrame:
     """Agregados diarios para consumo tipo OLAP."""
     return (
-        df.groupBy("year", "month", "day", "casa", "moneda", "source")
+        valid_quotes.groupBy("year", "month", "day", "casa", "moneda", "origen_datos")
         .agg(
             F.count("*").alias("cotizaciones"),
             F.avg("compra").alias("compra_promedio"),
@@ -109,23 +106,22 @@ def _build_daily_metrics(df: DataFrame) -> DataFrame:
     )
 
 
-def _build_brecha(latest: DataFrame) -> DataFrame:
+def build_official_gap(latest_quotes: DataFrame) -> DataFrame:
     """Brecha de venta vs el oficial USD más reciente del snapshot."""
-    oficial = (
-        latest.filter((F.col("casa") == "oficial") & (F.col("moneda") == "USD"))
+    official_usd = (
+        latest_quotes.filter((F.col("casa") == "oficial") & (F.col("moneda") == "USD"))
         .select(F.col("venta").alias("venta_oficial"))
         .limit(1)
     )
-    joined = latest.crossJoin(oficial)
+    quotes_with_official = latest_quotes.crossJoin(official_usd)
     return (
-        joined.withColumn(
+        quotes_with_official.withColumn(
             "brecha_oficial_pct",
             F.when(
                 (F.col("moneda") == "USD") & (F.col("venta_oficial") > 0),
                 ((F.col("venta") - F.col("venta_oficial")) / F.col("venta_oficial")) * 100.0,
             ),
-        )
-        .select(
+        ).select(
             "casa",
             "nombre",
             "moneda",
@@ -139,12 +135,23 @@ def _build_brecha(latest: DataFrame) -> DataFrame:
     )
 
 
-def _write_gold(df: DataFrame, path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    (
-        df.write.format("delta")
+def write_gold_table(
+    gold_df: DataFrame,
+    destination: Path,
+    partition_columns: tuple[str, ...] | None = None,
+) -> None:
+    """Persiste una entidad Gold. Solo particiona si el volumen/consulta lo justifica."""
+    destination.mkdir(parents=True, exist_ok=True)
+    writer = (
+        gold_df.write.format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
-        .save(str(path))
     )
-    logger.info("Gold | escrito Delta en %s", path)
+    if partition_columns:
+        writer = writer.partitionBy(*partition_columns)
+    writer.save(str(destination))
+    logger.info(
+        "Gold | escrito Delta en %s | particiones=%s",
+        destination,
+        partition_columns or "ninguna",
+    )

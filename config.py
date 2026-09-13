@@ -67,6 +67,7 @@ SPARK_DELTA_CONFIG: dict[str, str] = {
     "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog",
     "spark.databricks.delta.checkpointInterval": DELTA_LOG_CHECKPOINT_INTERVAL,
     "spark.databricks.delta.schema.autoMerge.enabled": "true",
+    "spark.databricks.delta.optimizeWrite.enabled": "true",
     "spark.sql.session.timeZone": SPARK_TIMEZONE,
     "spark.sql.shuffle.partitions": SPARK_SHUFFLE_PARTITIONS,
 }

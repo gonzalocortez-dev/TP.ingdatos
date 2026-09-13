@@ -16,7 +16,7 @@ EXTRACT (API full | incremental + watermark)
 | --- | --- | --- | --- |
 | **Bronze** | Raw lake / schema-on-read | Payload de la API **sin casteo ni métricas**. Precios y fechas quedan como `string`. Se agregan solo metadatos de ingesta (`fecha_ingesta`, `origen_datos`) | **Delta**: FULL → `overwrite` · INCREMENTAL → `MERGE` |
 | **Silver** | Hechos de negocio | Tipos, nulos, dedup, `spread` / `mid_price`, `quality_ok` | **Delta**, overwrite particionado `year/month/casa` |
-| **Gold** | Consumo analítico / OLAP | `latest`, `daily_metrics`, `brecha` | **Delta**, overwrite |
+| **Gold** | Consumo analítico / OLAP | `latest`, `daily_metrics`, `brecha` | **Delta**: `daily_metrics` particionado `year/month`; `latest`/`brecha` sin partición (tablas chicas) |
 
 Cómo se comprueba que **sí es Delta** (no Parquet suelto):
 
@@ -38,6 +38,32 @@ Los campos de negocio se copian tal cual. Lo único que se agrega es trazabilida
 | `modo_extraccion` | `full` o `incremental` |
 | `batch_id` | Id del lote |
 | `raw_json` | Payload original serializado |
+
+## Extracción: ambos endpoints + chequeo
+
+Se consultan `/v1/dolares` y `/v1/cotizaciones` con timeout, reintentos y `Accept: application/json`. Cada respuesta se valida:
+
+1. HTTP 200
+2. Cuerpo JSON
+3. Lista no vacía
+4. Campos obligatorios: `moneda`, `casa`, `nombre`, `compra`, `venta`, `fechaActualizacion`
+
+Los registros incompletos se descartan. Si un endpoint no deja ninguno válido, la extracción aborta.
+
+## Transformaciones Silver (`transform_layer.py`)
+
+1. Casteo y normalización de tipos / texto
+2. Fechas a UTC
+3. Nulos categóricos
+4. Columnas de negocio (`spread`, `mid_price`, tags, `year/month/day`)
+5. Calidad (`quality_ok`) sin borrar filas
+6. Deduplicación por `business_key`
+
+## Particionado
+
+- **Silver**: `year/month/casa` — lecturas por fecha y mercado.
+- **Gold `daily_metrics`**: `year/month` — serie temporal.
+- **Bronze / Gold `latest` / `brecha`**: sin partición. Son snapshots chicos; partirlos genera carpetas vacías y empeora el listado.
 
 ## Watermark (extracción incremental)
 
@@ -93,7 +119,7 @@ python main.py --mode incremental
 
 ```text
 config.py           URLs, rutas del lake, SPARK_DELTA_CONFIG
-extractors.py       FULL / INCREMENTAL + persistencia del watermark
+extractors.py       FULL / INCREMENTAL, watermark y validación HTTP/JSON
 bronze_layer.py     Load crudo + metadatos + overwrite/MERGE
 transform_layer.py  Limpieza PySpark (Bronze → Silver)
 gold_layer.py       Persistencia Silver + agregados Gold

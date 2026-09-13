@@ -5,8 +5,6 @@ description = "Pipeline de ingeniería de datos para cotizaciones de DolarAPI co
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "pandas>=2.2.0",
-    "pyarrow>=16.0.0",
     "requests>=2.32.0",
     "python-dotenv>=1.0.1",
     "pyspark==3.5.3",

@@ -1,4 +1,4 @@
-"""Pruebas del extractor incremental y del watermark persistido (sin Spark)."""
+"""Pruebas de extracción, watermark y chequeo de payload (sin Spark)."""
 
 from __future__ import annotations
 
@@ -6,12 +6,19 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from bronze_layer import resolve_bronze_write_strategy
-from extractors import DolarApiExtractor, _parse_api_timestamp
+from extractors import (
+    DolarApiExtractor,
+    parse_api_timestamp,
+    parse_successful_json_response,
+    validate_api_payload,
+)
 
 
 def test_parse_api_timestamp_zulu() -> None:
-    parsed = _parse_api_timestamp("2026-09-05T20:56:00.000Z")
+    parsed = parse_api_timestamp("2026-09-05T20:56:00.000Z")
     assert parsed is not None
     assert parsed.tzinfo is not None
 
@@ -77,3 +84,51 @@ def test_bronze_write_strategy() -> None:
     assert resolve_bronze_write_strategy("full", False) == "overwrite"
     assert resolve_bronze_write_strategy("incremental", True) == "merge"
     assert resolve_bronze_write_strategy("incremental", False) == "overwrite"
+
+
+def _valid_quote(**overrides):
+    row = {
+        "moneda": "USD",
+        "casa": "oficial",
+        "nombre": "Oficial",
+        "compra": 1400,
+        "venta": 1450,
+        "fechaActualizacion": "2026-09-05T20:56:00.000Z",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_validate_api_payload_keeps_complete_records() -> None:
+    valid = validate_api_payload([_valid_quote(), _valid_quote(casa="blue")], "/v1/dolares")
+    assert len(valid) == 2
+
+
+def test_validate_api_payload_discards_incomplete_records() -> None:
+    payload = [_valid_quote(), {"casa": "blue", "moneda": "USD"}]
+    valid = validate_api_payload(payload, "/v1/dolares")
+    assert len(valid) == 1
+    assert valid[0]["casa"] == "oficial"
+
+
+def test_validate_api_payload_rejects_empty_list() -> None:
+    with pytest.raises(RuntimeError, match="lista vacía"):
+        validate_api_payload([], "/v1/dolares")
+
+
+def test_validate_api_payload_rejects_all_invalid() -> None:
+    with pytest.raises(RuntimeError, match="Ningún registro válido"):
+        validate_api_payload([{"casa": "blue"}], "/v1/cotizaciones")
+
+
+def test_parse_successful_json_response_rejects_http_error() -> None:
+    class FakeResponse:
+        status_code = 503
+        text = "unavailable"
+        headers = {"Content-Type": "application/json"}
+
+        def json(self):
+            return []
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        parse_successful_json_response(FakeResponse(), "/v1/dolares")

@@ -4,15 +4,11 @@ La API pública no expone un query `since=` ni un id incremental.
 El modo incremental entonces:
 
 1. Consulta el snapshot actual (mismos endpoints que FULL).
-2. Lee el watermark persistido (última fecha de modificación procesada).
-3. Se queda solo con filas cuya `fechaActualizacion` es posterior al watermark.
+2. Chequea HTTP, JSON y campos obligatorios de cada registro.
+3. Lee el watermark persistido (última fecha de modificación procesada).
+4. Se queda solo con filas cuya `fechaActualizacion` es posterior al watermark.
 
-El estado se guarda en data_lake/metadata/extract_watermark.json:
-
-- watermark: max(fechaActualizacion) ya procesada
-- watermark_field: nombre del campo cursor
-- last_run_at: fecha/hora de la última ejecución del extractor
-- last_mode / last_records: auditoría de la corrida
+El estado se guarda en data_lake/metadata/extract_watermark.json.
 """
 
 from __future__ import annotations
@@ -38,6 +34,16 @@ from config import (
 logger = logging.getLogger(__name__)
 
 ExtractMode = Literal["full", "incremental"]
+
+# Contrato mínimo de DolarAPI. Si falta alguno, el registro no entra al lake.
+REQUIRED_API_FIELDS: tuple[str, ...] = (
+    "moneda",
+    "casa",
+    "nombre",
+    "compra",
+    "venta",
+    "fechaActualizacion",
+)
 
 
 class DolarApiExtractor:
@@ -66,7 +72,7 @@ class DolarApiExtractor:
             mode: ``full`` trae todo. ``incremental`` filtra por watermark.
 
         Returns:
-            Lista de dicts tal como los devolvió la API, más origen/endpoint.
+            Lista de dicts validados, más origen/endpoint.
         """
         if mode == "full":
             return self.extract_full()
@@ -75,15 +81,12 @@ class DolarApiExtractor:
         raise ValueError(f"Modo de extracción no soportado: {mode}")
 
     def extract_full(self) -> list[dict[str, Any]]:
-        """Descarga el snapshot completo de todos los endpoints configurados."""
+        """Descarga y valida el snapshot completo de todos los endpoints."""
         records: list[dict[str, Any]] = []
         for source_name, path in API_ENDPOINTS:
-            payload = self._get_json(path)
-            items = payload if isinstance(payload, list) else [payload]
-            logger.info("FULL | endpoint %s: %s registros", path, len(items))
+            items = self._fetch_validated_records(path)
+            logger.info("FULL | endpoint %s: %s registros válidos", path, len(items))
             for item in items:
-                if not isinstance(item, dict):
-                    continue
                 row = dict(item)
                 row["_endpoint"] = path
                 row["_source_name"] = source_name
@@ -106,7 +109,7 @@ class DolarApiExtractor:
 
         filtered: list[dict[str, Any]] = []
         for row in snapshot:
-            updated_at = _parse_api_timestamp(row.get(WATERMARK_FIELD))
+            updated_at = parse_api_timestamp(row.get(WATERMARK_FIELD))
             if updated_at is not None and updated_at > watermark:
                 filtered.append(row)
         logger.info(
@@ -119,11 +122,7 @@ class DolarApiExtractor:
         return filtered
 
     def load_watermark(self) -> datetime | None:
-        """Lee la última fecha de modificación ya procesada.
-
-        Returns:
-            datetime UTC del watermark, o None si nunca se persistió estado.
-        """
+        """Lee la última fecha de modificación ya procesada."""
         state = self._read_state()
         raw = state.get("watermark")
         if not raw:
@@ -141,22 +140,17 @@ class DolarApiExtractor:
     ) -> None:
         """Persiste watermark + fecha de la última ejecución.
 
-        - Si el lote trae fechas, el watermark avanza al max(fechaActualizacion).
-        - Si el lote viene vacío (incremental sin novedades), se conserva el
-          watermark anterior y solo se actualiza last_run_at.
+        Si el lote viene vacío se conserva el watermark anterior y solo
+        se actualiza last_run_at.
         """
         previous = self._read_state()
         timestamps = [
             ts
-            for ts in (_parse_api_timestamp(row.get(WATERMARK_FIELD)) for row in records)
+            for ts in (parse_api_timestamp(row.get(WATERMARK_FIELD)) for row in records)
             if ts is not None
         ]
         latest = max(timestamps) if timestamps else None
-        if latest is None:
-            previous_wm = previous.get("watermark")
-            latest_text = previous_wm
-        else:
-            latest_text = latest.isoformat()
+        latest_text = latest.isoformat() if latest is not None else previous.get("watermark")
 
         state = {
             "watermark": latest_text,
@@ -188,15 +182,19 @@ class DolarApiExtractor:
             return {}
         return payload if isinstance(payload, dict) else {}
 
+    def _fetch_validated_records(self, path: str) -> list[dict[str, Any]]:
+        """GET + chequeo de HTTP/JSON + validación de campos de negocio."""
+        payload = self._get_json(path)
+        return validate_api_payload(payload, endpoint=path)
+
     def _get_json(self, path: str) -> Any:
         url = f"{self.base_url}{path}"
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
                 response = self.session.get(url, timeout=self.timeout)
-                response.raise_for_status()
-                return response.json()
-            except (requests.RequestException, ValueError) as exc:
+                return parse_successful_json_response(response, endpoint=path)
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
                 last_error = exc
                 wait_seconds = 2 ** (attempt - 1)
                 logger.warning(
@@ -211,7 +209,87 @@ class DolarApiExtractor:
         raise RuntimeError(f"No se pudo extraer {url}") from last_error
 
 
-def _parse_api_timestamp(value: Any) -> datetime | None:
+def parse_successful_json_response(
+    response: requests.Response,
+    endpoint: str,
+) -> Any:
+    """Chequea status HTTP y que el cuerpo sea JSON.
+
+    Args:
+        response: respuesta cruda de ``requests``.
+        endpoint: path consultado, solo para el mensaje de error.
+
+    Raises:
+        RuntimeError: si el status no es 200 o el cuerpo no es JSON.
+    """
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"HTTP {response.status_code} en {endpoint}: {response.text[:200]}"
+        )
+    content_type = response.headers.get("Content-Type", "")
+    if content_type and "json" not in content_type.lower():
+        logger.warning(
+            "Content-Type inesperado en %s: %s. Se intenta parsear igual.",
+            endpoint,
+            content_type,
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"La respuesta de {endpoint} no es JSON válido") from exc
+    logger.info("Chequeo HTTP OK | endpoint=%s | status=%s", endpoint, response.status_code)
+    return payload
+
+
+def validate_api_payload(payload: Any, endpoint: str) -> list[dict[str, Any]]:
+    """Valida forma y campos obligatorios del payload de un endpoint.
+
+    - Debe ser lista (o un objeto único, que se envuelve).
+    - No puede venir vacía.
+    - Cada ítem debe ser dict y traer REQUIRED_API_FIELDS.
+    Los registros incompletos se descartan y se loguean; si no queda
+    ninguno válido, se aborta la extracción de ese endpoint.
+    """
+    if payload is None:
+        raise RuntimeError(f"Endpoint {endpoint} devolvió null")
+
+    items = payload if isinstance(payload, list) else [payload]
+    if not items:
+        raise RuntimeError(f"Endpoint {endpoint} devolvió una lista vacía")
+
+    valid_records: list[dict[str, Any]] = []
+    discarded = 0
+    for item in items:
+        if not isinstance(item, dict):
+            discarded += 1
+            logger.warning("Registro no-objeto descartado en %s: %s", endpoint, item)
+            continue
+        missing_fields = [field for field in REQUIRED_API_FIELDS if field not in item]
+        if missing_fields:
+            discarded += 1
+            logger.warning(
+                "Registro inválido en %s, faltan %s",
+                endpoint,
+                missing_fields,
+            )
+            continue
+        valid_records.append(item)
+
+    if not valid_records:
+        raise RuntimeError(
+            f"Ningún registro válido en {endpoint} (recibidos={len(items)}, descartados={discarded})"
+        )
+    logger.info(
+        "Chequeo payload OK | endpoint=%s | recibidos=%s | válidos=%s | descartados=%s",
+        endpoint,
+        len(items),
+        len(valid_records),
+        discarded,
+    )
+    return valid_records
+
+
+def parse_api_timestamp(value: Any) -> datetime | None:
     """Convierte fechaActualizacion de la API a datetime UTC. No muta el registro."""
     if value is None or value == "":
         return None

@@ -2,13 +2,14 @@
 
 Se ejecutan DESPUÉS del Load. Es el paso T del ELT.
 
-Qué se hace acá (y no en Bronze)
---------------------------------
-1. Casteo de compra/venta a double y fechas a timestamp UTC.
-2. Normalización de texto (trim, casing).
-3. Imputación de nulos categóricos.
-4. Deduplicación por clave de negocio.
-5. Columnas de negocio: spread, mid_price, quality_ok, partition cols.
+Tareas de transformación (más de cuatro)
+----------------------------------------
+1. Casteo y normalización de tipos / texto.
+2. Estandarización de fechas a UTC.
+3. Tratamiento de nulos categóricos.
+4. Columnas de negocio (spread, mid_price, tags, particiones).
+5. Reglas de calidad (quality_ok) sin borrar filas.
+6. Deduplicación por clave de negocio.
 """
 
 from __future__ import annotations
@@ -22,29 +23,22 @@ from pyspark.sql.window import Window
 logger = logging.getLogger(__name__)
 
 
-def bronze_to_silver(bronze_df: DataFrame) -> DataFrame:
-    """Aplica la cadena de limpieza sobre el histórico Bronze.
-
-    Args:
-        bronze_df: DataFrame leído de data_lake/bronze/quotes (Delta).
-
-    Returns:
-        DataFrame Silver listo para persistir.
-    """
-    df = _cast_and_normalize(bronze_df)
-    df = _fill_nulls(df)
-    df = _add_business_columns(df)
-    df = _flag_quality(df)
-    df = _deduplicate(df)
+def transform_bronze_to_silver(bronze_df: DataFrame) -> DataFrame:
+    """Aplica la cadena de limpieza sobre el histórico Bronze."""
+    cleaned = cast_and_normalize_types(bronze_df)
+    cleaned = standardize_timestamps_to_utc(cleaned)
+    cleaned = fill_categorical_nulls(cleaned)
+    cleaned = add_business_columns(cleaned)
+    cleaned = flag_data_quality(cleaned)
+    cleaned = deduplicate_by_business_key(cleaned)
     logger.info("Transform | Bronze → Silver listo")
-    return df
+    return cleaned
 
 
-def _cast_and_normalize(df: DataFrame) -> DataFrame:
-    """Tipos reales + nombres snake_case. Acá sí se interpreta el crudo."""
+def cast_and_normalize_types(bronze_df: DataFrame) -> DataFrame:
+    """Castea precios y normaliza texto. Todavía no interpreta zonas horarias."""
     return (
-        df.select(
-            F.col("origen_datos").alias("source"),
+        bronze_df.select(
             F.col("origen_datos"),
             F.col("endpoint"),
             F.col("fecha_ingesta").alias("fecha_ingesta_raw"),
@@ -63,31 +57,40 @@ def _cast_and_normalize(df: DataFrame) -> DataFrame:
         .withColumn("nombre", F.initcap(F.col("nombre_raw")))
         .withColumn("compra", F.col("compra_raw").cast("double"))
         .withColumn("venta", F.col("venta_raw").cast("double"))
-        .withColumn(
-            "fecha_actualizacion",
-            F.to_timestamp(F.col("fecha_raw")),
-        )
-        .withColumn("fecha_ingesta", F.to_timestamp(F.col("fecha_ingesta_raw")))
-        .withColumn("ingest_ts", F.col("fecha_ingesta"))
+        .withColumn("fecha_actualizacion_naive", F.to_timestamp(F.col("fecha_raw")))
+        .withColumn("fecha_ingesta_naive", F.to_timestamp(F.col("fecha_ingesta_raw")))
     )
 
 
-def _fill_nulls(df: DataFrame) -> DataFrame:
+def standardize_timestamps_to_utc(quotes_df: DataFrame) -> DataFrame:
+    """Lleva fechas de cotización e ingesta a UTC (sesión Spark ya es UTC)."""
+    return (
+        quotes_df.withColumn(
+            "fecha_actualizacion",
+            F.to_utc_timestamp(F.col("fecha_actualizacion_naive"), "UTC"),
+        ).withColumn(
+            "fecha_ingesta",
+            F.to_utc_timestamp(F.col("fecha_ingesta_naive"), "UTC"),
+        )
+    )
+
+
+def fill_categorical_nulls(quotes_df: DataFrame) -> DataFrame:
     """Completa categóricos. Los precios nulos se dejan nulos y se marcan después."""
     return (
-        df.fillna({"casa": "desconocida", "nombre": "N/A", "moneda": "N/A"})
+        quotes_df.fillna({"casa": "desconocida", "nombre": "N/A", "moneda": "N/A"})
         .withColumn(
             "fecha_actualizacion",
             F.coalesce(
                 F.col("fecha_actualizacion"),
-                F.to_timestamp(F.lit("1900-01-01 00:00:00")),
+                F.to_utc_timestamp(F.to_timestamp(F.lit("1900-01-01 00:00:00")), "UTC"),
             ),
         )
     )
 
 
-def _add_business_columns(df: DataFrame) -> DataFrame:
-    """Métricas y particiones. Solo tienen sentido sobre datos ya tipados."""
+def add_business_columns(quotes_df: DataFrame) -> DataFrame:
+    """Métricas, tags de mercado y columnas de partición."""
     market_tags = (
         F.when(F.col("casa") == "oficial", F.lit("regulado,banco,bcra"))
         .when(F.col("casa") == "blue", F.lit("paralelo,informal"))
@@ -99,7 +102,7 @@ def _add_business_columns(df: DataFrame) -> DataFrame:
         .otherwise(F.lit("otro"))
     )
     return (
-        df.withColumn("spread", F.col("venta") - F.col("compra"))
+        quotes_df.withColumn("spread", F.col("venta") - F.col("compra"))
         .withColumn("mid_price", (F.col("venta") + F.col("compra")) / F.lit(2.0))
         .withColumn(
             "spread_pct",
@@ -113,7 +116,7 @@ def _add_business_columns(df: DataFrame) -> DataFrame:
             "business_key",
             F.concat_ws(
                 "|",
-                F.col("source"),
+                F.col("origen_datos"),
                 F.col("casa"),
                 F.col("moneda"),
                 F.col("fecha_actualizacion").cast("string"),
@@ -122,35 +125,37 @@ def _add_business_columns(df: DataFrame) -> DataFrame:
     )
 
 
-def _flag_quality(df: DataFrame) -> DataFrame:
+def flag_data_quality(quotes_df: DataFrame) -> DataFrame:
     """Marca calidad sin borrar filas: Silver conserva trazabilidad."""
+    sentinel_date = F.to_utc_timestamp(F.to_timestamp(F.lit("1900-01-01 00:00:00")), "UTC")
     invalid = (
         F.col("compra").isNull()
         | F.col("venta").isNull()
         | (F.col("compra") < 0)
         | (F.col("venta") < 0)
         | (F.col("venta") < F.col("compra"))
-        | (F.col("fecha_actualizacion") == F.to_timestamp(F.lit("1900-01-01 00:00:00")))
+        | (F.col("fecha_actualizacion") == sentinel_date)
     )
-    return df.withColumn("quality_ok", ~invalid)
+    return quotes_df.withColumn("quality_ok", ~invalid)
 
 
-def _deduplicate(df: DataFrame) -> DataFrame:
+def deduplicate_by_business_key(quotes_df: DataFrame) -> DataFrame:
     """Una fila vigente por business_key: gana la ingestión más reciente."""
-    window = Window.partitionBy("business_key").orderBy(F.col("ingest_ts").desc_nulls_last())
+    latest_ingest_window = Window.partitionBy("business_key").orderBy(
+        F.col("fecha_ingesta").desc_nulls_last()
+    )
     return (
-        df.withColumn("_rn", F.row_number().over(window))
-        .filter(F.col("_rn") == 1)
-        .drop("_rn")
+        quotes_df.withColumn("row_version", F.row_number().over(latest_ingest_window))
+        .filter(F.col("row_version") == 1)
+        .drop("row_version")
     )
 
 
-def select_silver_columns(df: DataFrame) -> DataFrame:
+def select_silver_columns(quotes_df: DataFrame) -> DataFrame:
     """Contrato de columnas de la tabla Silver."""
-    return df.select(
+    return quotes_df.select(
         "business_key",
         "origen_datos",
-        "source",
         "endpoint",
         "modo_extraccion",
         "batch_id",
@@ -165,7 +170,6 @@ def select_silver_columns(df: DataFrame) -> DataFrame:
         "market_tags",
         "fecha_actualizacion",
         "fecha_ingesta",
-        "ingest_ts",
         "quality_ok",
         "year",
         "month",

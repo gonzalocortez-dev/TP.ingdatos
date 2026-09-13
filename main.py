@@ -28,7 +28,7 @@ from config import LAKE_ROOT, ensure_lake_dirs
 from extractors import DolarApiExtractor, ExtractMode
 from gold_layer import build_and_persist_gold, persist_silver
 from spark_session import get_spark
-from transform_layer import bronze_to_silver
+from transform_layer import transform_bronze_to_silver
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,7 +73,7 @@ def run_pipeline(mode: ExtractMode) -> dict[str, int]:
     # --- 3. TRANSFORM + persist Silver ------------------------------------
     logger.info("=== TRANSFORM Bronze → Silver ===")
     bronze_df = read_bronze(spark)
-    silver_df = bronze_to_silver(bronze_df)
+    silver_df = transform_bronze_to_silver(bronze_df)
     persist_silver(silver_df)
 
     # --- 4. GOLD (agregados OLAP) -----------------------------------------
